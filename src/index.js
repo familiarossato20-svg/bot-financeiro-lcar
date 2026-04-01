@@ -1,209 +1,147 @@
 require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require("@whiskeysockets/baileys");
+const { Boom } = require("@hapi/boom");
+const qrcode = require("qrcode-terminal");
+const fs = require("fs");
+const path = require("path");
+
 const { transcribeAudio } = require("./transcribe");
 const { extrairDadosFinanceiros } = require("./extract");
 const { lancarGasto, inicializarPlanilha } = require("./sheets");
-const {
-  enviarMensagem,
-  formatarConfirmacao,
-  formatarErro,
-} = require("./whatsapp");
 
-const app = express();
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+const NUMERO_AUTORIZADO = process.env.NUMERO_AUTORIZADO || "";
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-app.get("/", (req, res) => {
-  res.json({
-    status: "🟢 Bot financeiro online",
-    versao: "1.0.0",
-    timestamp: new Date().toISOString(),
-  });
-});
+let sock = null;
 
-// ============================================================
-// WEBHOOK PRINCIPAL - BotConversa
-// ============================================================
-app.post("/webhook/financeiro", async (req, res) => {
-  // Responde imediatamente para o BotConversa não dar timeout
-  res.status(200).json({ received: true });
-
+async function enviarMensagem(jid, texto) {
   try {
-    const payload = req.body;
-    console.log("📩 Webhook recebido:", JSON.stringify(payload, null, 2));
+    if (!sock) return;
+    await sock.sendMessage(jid, { text: texto });
+    console.log("✅ Mensagem enviada para " + jid);
+  } catch (err) {
+    console.error("❌ Erro ao enviar mensagem:", err.message);
+  }
+}
 
-    // Extrai dados do payload do BotConversa
-    const telefone = extrairTelefone(payload);
-    const tipoMensagem = extrairTipoMensagem(payload);
-    const audioUrl = extrairAudioUrl(payload);
-    const textoMensagem = extrairTexto(payload);
+function formatarConfirmacao(dados, dataInfo) {
+  const emoji = dados.tipo === "empresarial" ? "🏢" : "👤";
+  const valorFormatado = "R$ " + dados.valor.toFixed(2).replace(".", ",");
+  let msg = "✅ *Lançamento registrado!*\n\n";
+  msg += emoji + " *Tipo:* " + dados.tipo.charAt(0).toUpperCase() + dados.tipo.slice(1) + "\n";
+  msg += "💰 *Valor:* " + valorFormatado + "\n";
+  msg += "📂 *Categoria:* " + dados.categoria + "\n";
+  msg += "📝 *Descrição:* " + dados.descricao + "\n";
+  msg += "💳 *Pagamento:* " + dados.forma_pagamento + "\n";
+  msg += "📅 *Data:* " + dataInfo.data + " às " + dataInfo.hora + "\n";
+  if (dados.confianca === "baixa") msg += "\n⚠️ _Baixa confiança. Verifique na planilha._";
+  msg += "\n\n📊 _Planilha atualizada!_";
+  return msg;
+}
 
-    if (!telefone) {
-      console.log("⚠️ Telefone não encontrado no payload");
-      return;
-    }
-
-    let transcricao = "";
-
-    if (tipoMensagem === "audio" && audioUrl) {
-      // --- FLUXO ÁUDIO ---
-      console.log(`🎤 Áudio recebido de ${telefone}: ${audioUrl}`);
-
-      const audioResponse = await axios.get(audioUrl, {
-        responseType: "arraybuffer",
-        timeout: 30000,
-        headers: { "API-KEY": process.env.BOTCONVERSA_API_KEY },
-      });
-
-      const audioBuffer = Buffer.from(audioResponse.data);
-      const mimeType = audioResponse.headers["content-type"] || "audio/ogg";
-      console.log(`📥 Áudio baixado: ${audioBuffer.length} bytes, tipo: ${mimeType}`);
-
-      transcricao = await transcribeAudio(audioBuffer, mimeType);
-      console.log(`📝 Transcrição: "${transcricao}"`);
-
+async function processarMensagem(jid, tipo, conteudo) {
+  let transcricao = "";
+  try {
+    if (tipo === "audio") {
+      console.log("🎤 Áudio recebido de " + jid);
+      transcricao = await transcribeAudio(conteudo.buffer, conteudo.mimeType);
+      console.log("📝 Transcrição: \"" + transcricao + "\"");
       if (!transcricao || transcricao.length < 3) {
-        await enviarMensagem(telefone, "⚠️ Não consegui entender o áudio. Tente falar mais devagar.");
+        await enviarMensagem(jid, "⚠️ Não entendi o áudio. Tente falar mais devagar.");
         return;
       }
-
-    } else if (textoMensagem && textoMensagem.length > 3) {
-      // --- FLUXO TEXTO ---
-      transcricao = textoMensagem;
-      console.log(`💬 Texto recebido de ${telefone}: "${transcricao}"`);
-
+    } else if (tipo === "texto") {
+      transcricao = conteudo.texto;
+      console.log("💬 Texto: \"" + transcricao + "\"");
     } else {
-      await enviarMensagem(
-        telefone,
-        "💡 Manda um áudio ou texto descrevendo o gasto.\n\nExemplo: _\"Gastei 150 reais em combustível da empresa\"_"
-      );
+      await enviarMensagem(jid, "💡 Manda um áudio ou texto com o gasto.\nEx: _\"Gastei 150 em combustível da empresa\"_");
       return;
     }
 
-    // 3. Extrai dados financeiros com Claude
     const dados = await extrairDadosFinanceiros(transcricao);
-    console.log("💡 Dados extraídos:", dados);
+    console.log("💡 Dados:", dados);
 
     if (!dados.valor || dados.valor === 0) {
-      await enviarMensagem(telefone, formatarErro("sem_valor"));
+      await enviarMensagem(jid, "⚠️ Não identifiquei o *valor*.\nTente: _\"Gastei R$ 150 em combustível da empresa\"_");
       return;
     }
 
-    // 4. Lança na planilha
-    const dataInfo = await lancarGasto(dados, transcricao, telefone);
-    console.log("✅ Lançado na planilha:", dataInfo);
-
-    // 5. Confirma para o usuário
-    const confirmacao = formatarConfirmacao(dados, dataInfo);
-    await enviarMensagem(telefone, confirmacao);
+    const dataInfo = await lancarGasto(dados, transcricao, jid);
+    await enviarMensagem(jid, formatarConfirmacao(dados, dataInfo));
 
   } catch (err) {
-    console.error("❌ Erro no processamento:", err.message, err.stack);
+    console.error("❌ Erro:", err.message);
+    await enviarMensagem(jid, "❌ Erro interno. Tente novamente.");
   }
-});
+}
 
-// ============================================================
-// ENDPOINT DE TESTE (para verificar se está funcionando)
-// ============================================================
-app.post("/webhook/teste", async (req, res) => {
-  try {
-    const { texto, telefone } = req.body;
+async function conectarWhatsApp() {
+  const authDir = path.join(__dirname, "../auth_info");
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-    if (!texto) {
-      return res.json({ erro: "Envie um campo 'texto' para testar" });
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    logger: require("pino")({ level: "silent" }),
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      console.log("\n📱 ESCANEIE O QR CODE ABAIXO NO WHATSAPP:\n");
+      qrcode.generate(qr, { small: true });
+      console.log("\n(WhatsApp > ... > Dispositivos conectados > Conectar dispositivo)\n");
     }
+    if (connection === "close") {
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const reconectar = code !== DisconnectReason.loggedOut;
+      console.log("🔴 Conexão encerrada. Reconectar: " + reconectar);
+      if (reconectar) setTimeout(conectarWhatsApp, 3000);
+      else console.log("🚪 Deslogado. Delete auth_info e reinicie.");
+    }
+    if (connection === "open") {
+      console.log("✅ WhatsApp conectado!");
+      try { await inicializarPlanilha(); } catch (e) { console.error("⚠️ Planilha:", e.message); }
+    }
+  });
 
-    const dados = await extrairDadosFinanceiros(texto);
-    const dataInfo = await lancarGasto(dados, texto, telefone || "5548000000000");
-    const confirmacao = formatarConfirmacao(dados, dataInfo);
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;
+      if (!msg.message) continue;
+      const jid = msg.key.remoteJid;
+      if (!jid) continue;
 
-    res.json({
-      transcricao: texto,
-      dados_extraidos: dados,
-      confirmacao_formatada: confirmacao,
-      status: "✅ Lançado com sucesso",
-    });
-  } catch (err) {
-    res.status(500).json({ erro: err.message });
-  }
-});
+      if (NUMERO_AUTORIZADO) {
+        const num = jid.replace("@s.whatsapp.net", "").replace("@g.us", "");
+        if (!NUMERO_AUTORIZADO.includes(num)) { console.log("⚠️ Ignorado: " + jid); continue; }
+      }
 
-// ============================================================
-// HELPERS - Extração de dados do payload BotConversa
-// ============================================================
+      const m = msg.message;
+      if (m.audioMessage || m.pttMessage) {
+        try {
+          const buffer = await downloadMediaMessage(msg, "buffer", {});
+          const mimeType = (m.audioMessage || m.pttMessage).mimetype || "audio/ogg; codecs=opus";
+          await processarMensagem(jid, "audio", { buffer, mimeType });
+        } catch (e) {
+          console.error("❌ Áudio:", e.message);
+          await enviarMensagem(jid, "❌ Erro ao processar áudio.");
+        }
+        continue;
+      }
 
-function extrairTelefone(payload) {
-  return (
-    payload?.phone ||
-    payload?.subscriber?.phone ||
-    payload?.contact?.phone ||
-    payload?.data?.phone ||
-    null
-  );
+      const texto = m.conversation || m.extendedTextMessage?.text;
+      if (texto && texto.trim().length > 3) {
+        await processarMensagem(jid, "texto", { texto: texto.trim() });
+      }
+    }
+  });
 }
 
-function extrairTipoMensagem(payload) {
-  const tipo = (
-    payload?.message_type ||
-    payload?.type ||
-    payload?.message?.type ||
-    ""
-  ).toLowerCase();
-
-  if (tipo.includes("audio") || tipo.includes("voice") || tipo.includes("ptt"))
-    return "audio";
-  if (tipo.includes("text")) return "text";
-
-  // Se tem audio_url mas não tem tipo, assume audio
-  if (payload?.audio_url || payload?.media_url) return "audio";
-  // Se tem texto, assume text
-  if (payload?.text || payload?.message_text || payload?.body) return "text";
-
-  return tipo;
-}
-
-function extrairAudioUrl(payload) {
-  return (
-    payload?.audio_url ||
-    payload?.media_url ||
-    payload?.message?.url ||
-    payload?.file_url ||
-    null
-  );
-}
-
-function extrairTexto(payload) {
-  return (
-    payload?.text ||
-    payload?.message_text ||
-    payload?.body ||
-    payload?.message?.text ||
-    payload?.last_message ||
-    null
-  );
-}
-
-// ============================================================
-// INICIALIZAÇÃO
-// ============================================================
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, async () => {
-  console.log(`🚀 Bot financeiro rodando na porta ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/`);
-  console.log(`🔗 Webhook URL: http://localhost:${PORT}/webhook/financeiro`);
-
-  // Inicializa planilha automaticamente
-  try {
-    await inicializarPlanilha();
-  } catch (err) {
-    console.error(
-      "⚠️ Erro ao inicializar planilha (verifique as credenciais):",
-      err.message
-    );
-  }
-});
+console.log("🚀 Iniciando bot financeiro WhatsApp (Baileys)...");
+conectarWhatsApp();
